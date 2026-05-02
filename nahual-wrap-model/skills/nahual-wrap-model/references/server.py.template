@@ -1,0 +1,119 @@
+"""Nahual server for <MODEL>.
+
+<one-paragraph description: what the model is, what setup loads, what process
+returns, any caveats about weights/checkpoints>.
+
+Run with:
+    nix run --impure . -- ipc:///tmp/<MODEL>.ipc
+or:
+    python server.py ipc:///tmp/<MODEL>.ipc
+"""
+
+import sys
+from functools import partial
+from typing import Callable
+
+import numpy
+import pynng
+import torch
+import trio
+from nahual.preprocess import pad_channel_dim, validate_input_shape
+from nahual.server import responder
+
+# server.py captures argv[1] at import time; basic_test.py injects a
+# placeholder before importing this module.
+address = sys.argv[1]
+
+
+def setup(
+    # Expose every knob the upstream model takes that the client might want
+    # to override at startup. Defaults must produce a working model.
+    weights: str | None = None,
+    device: int | None = None,
+    expected_tile_size: int = 16,
+    expected_channels: int = 3,
+) -> tuple[Callable, dict]:
+    """Load the model and return (processor_partial, info_dict).
+
+    The info dict is JSON-serialized back to the client. It MUST contain a
+    `device` key for downstream tooling (and so the user can see whether
+    they actually got GPU).
+    """
+    if device is None:
+        device = 0
+    if torch.cuda.is_available():
+        torch_device = torch.device(int(device))
+    else:
+        torch_device = torch.device("cpu")
+
+    # ---- model construction goes here ----
+    # Prefer direct factory imports over torch.hub.load(..., source="local"),
+    # which has been known to stall under nix.
+    from <model_pkg>.<...> import <factory>
+    loaded_model = <factory>(...).to(torch_device).eval()
+    # --------------------------------------
+
+    info = {
+        "device": str(torch_device),
+        "expected_tile_size": expected_tile_size,
+        "expected_channels": expected_channels,
+        # Add any other shape/version info the client should see.
+    }
+
+    processor = partial(
+        process,
+        processor=loaded_model,
+        device=torch_device,
+        expected_tile_size=expected_tile_size,
+        expected_channels=expected_channels,
+    )
+    return processor, info
+
+
+def process(
+    pixels: numpy.ndarray,
+    processor: Callable,
+    device: torch.device,
+    expected_tile_size: int,
+    expected_channels: int,
+) -> numpy.ndarray:
+    """Run inference on a 5-D NCZYX numpy array.
+
+    For embedding models, return shape (N, embed_dim). If the upstream model
+    returns a dict (DINO-style), pluck the cls token here so clients always
+    get a 2-D array.
+    """
+    if pixels.ndim != 5:
+        raise ValueError(f"Expected NCZYX (5D) array, got shape {pixels.shape}")
+    _, _, _, *input_yx = pixels.shape
+    validate_input_shape(input_yx, expected_tile_size)
+
+    # Drops Z and pads channels up to expected_channels if needed.
+    pixels = pad_channel_dim(pixels, expected_channels)
+    torch_tensor = torch.from_numpy(pixels.copy()).float().to(device)
+
+    with torch.no_grad():
+        result = processor(torch_tensor)
+
+    if isinstance(result, dict):
+        for k in ("x_norm_clstoken", "cls", "cls_token", "logits"):
+            if k in result:
+                result = result[k]
+                break
+    elif isinstance(result, (list, tuple)):
+        result = result[0]
+    return result
+
+
+async def main():
+    with pynng.Rep0(listen=address, recv_timeout=300) as sock:
+        print(f"<MODEL> server listening on {address}", flush=True)
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(partial(responder, setup=setup), sock)
+
+
+if __name__ == "__main__":
+    try:
+        trio.run(main)
+    except KeyboardInterrupt:
+        pass

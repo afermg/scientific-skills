@@ -1,0 +1,84 @@
+"""Nahual server for <MODEL> (non-image input).
+
+For models that take 2-D `(N_samples, N_features)` arrays — e.g. single-cell
+encoders like CellWhisperer — instead of NCZYX images. The wire-up is the
+same; only the `process` contract differs.
+"""
+
+import sys
+from functools import partial
+from typing import Callable
+
+import numpy
+import pynng
+import torch
+import trio
+from nahual.server import responder
+
+address = sys.argv[1]
+
+
+def setup(
+    hidden_size: int = 256,
+    device: int | None = None,
+    weights: str | None = None,
+    # ... whatever shape/config knobs the upstream model exposes
+) -> tuple[Callable, dict]:
+    if device is None:
+        device = 0
+    if torch.cuda.is_available():
+        torch_device = torch.device(int(device))
+    else:
+        torch_device = torch.device("cpu")
+
+    # ---- model construction (random init or load `weights` if given) ----
+    model = ...
+    model.to(torch_device).eval()
+    # --------------------------------------------------------------------
+
+    info = {
+        "device": str(torch_device),
+        "embed_dim": hidden_size,
+        # ... other config worth exposing
+    }
+    processor = partial(process, model=model, device=torch_device)
+    return processor, info
+
+
+def process(
+    features: numpy.ndarray,
+    model,
+    device: torch.device,
+) -> torch.Tensor:
+    """Forward (N_samples, N_features) → (N_samples, embed_dim).
+
+    Returning a torch.Tensor is fine — Nahual's responder handles the move
+    to numpy.
+    """
+    if features.ndim != 2:
+        raise ValueError(
+            f"Expected 2D (samples, features) array; got shape {features.shape}"
+        )
+
+    x = torch.from_numpy(features).to(device)
+    with torch.no_grad():
+        out = model(x)
+        # Use whichever attribute is the right embedding (pooler_output,
+        # last_hidden_state[:, 0], etc.).
+        if hasattr(out, "pooler_output"):
+            out = out.pooler_output
+    return out
+
+
+async def main():
+    with pynng.Rep0(listen=address, recv_timeout=300) as sock:
+        print(f"<MODEL> server listening on {address}", flush=True)
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(partial(responder, setup=setup), sock)
+
+
+if __name__ == "__main__":
+    try:
+        trio.run(main)
+    except KeyboardInterrupt:
+        pass

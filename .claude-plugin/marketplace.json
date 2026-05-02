@@ -29,6 +29,13 @@
       "description": "Create Org Mode literate notebooks that use DuckDB SQL queries via org-babel to explore and analyze tabular data (CSV, Parquet) inside Emacs.",
       "category": "data-analysis",
       "keywords": ["org-mode", "emacs", "duckdb", "sql", "org-babel", "parquet"]
+    },
+    {
+      "name": "nahual-wrap-model",
+      "source": "./nahual-wrap-model",
+      "description": "Wrap a third-party deep learning model into a Nix flake exposing a Nahual server (server.py + flake.nix + basic_test.py), GPU-validated, pushed to a fork under afermg.",
+      "category": "bioimaging",
+      "keywords": ["nahual", "nix", "deep-learning", "wrap", "server", "gpu", "microscopy", "pytorch", "tensorflow"]
     }
   ]
 }

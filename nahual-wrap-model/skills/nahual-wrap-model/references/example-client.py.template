@@ -1,0 +1,37 @@
+"""
+This example uses a server within the environment defined on `https://github.com/afermg/<REPO>.git`.
+
+Run `nix run github:afermg/<REPO> -- ipc:///tmp/<MODEL>.ipc` from any directory,
+or `nix develop --command bash -c "python server.py ipc:///tmp/<MODEL>.ipc"` from
+the root of that repository.
+"""
+
+import numpy
+
+from nahual.process import dispatch_setup_process
+
+# For models whose key isn't in nahual's built-in registry, pass `signature`
+# explicitly. Image models that ARE in the registry (cellpose, dinov2,
+# dinov3, vit, ...) can omit it.
+setup, process = dispatch_setup_process("<MODEL>", signature=("dict", "numpy"))
+address = "ipc:///tmp/<MODEL>.ipc"
+
+# %% Load model server-side
+parameters = {
+    # Whatever your server.py setup() takes:
+    # "model_name": "...",
+    # "pretrained": False,
+    # "device": 0,
+}
+response = setup(parameters, address=address)
+print(response)
+
+# %% Define custom data
+# Image models: 5-D NCZYX (Z is squeezed server-side).
+# Single-cell models: 2-D (N_cells, N_features).
+tile_size = 224
+numpy.random.seed(seed=42)
+data = numpy.random.random_sample((2, 3, 1, tile_size, tile_size))
+result = process(data, address=address)
+print(result.shape)
+# Expected: (2, <embed_dim>)

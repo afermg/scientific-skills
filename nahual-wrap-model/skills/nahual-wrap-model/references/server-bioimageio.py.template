@@ -1,0 +1,97 @@
+"""Nahual server for the BioImage Model Zoo (generic).
+
+One server, any RDF: client passes the model identifier at `setup()` time
+(DOI, zenodo URL, nickname like ``"affable-shark"``, or a local rdf.yaml
+path). Backed by ``bioimageio.core``, which handles preprocessing
+(``zero_mean_unit_variance``, ``scale_range``) and postprocessing
+(``sigmoid``, ``binarize``) automatically per the RDF.
+
+Default `weight_format` is ONNX (or TorchScript fallback) — both are
+self-contained, no `architecture.source` Python import required. Models
+that publish only `pytorch_state_dict` weights need the `with-stardist` /
+`with-careamics` / `with-monai` flake variants.
+
+Run with:
+    nix run --impure . -- ipc:///tmp/bioimageio.ipc
+or:
+    nix run --impure .#with-stardist -- ipc:///tmp/bioimageio.ipc
+"""
+
+import sys
+from functools import partial
+from typing import Callable
+
+import numpy
+import pynng
+import trio
+import xarray
+from bioimageio.core import create_prediction_pipeline, load_description
+from nahual.server import responder
+
+address = sys.argv[1]
+
+
+def setup(
+    source: str,
+    weight_format: str | None = None,
+    device: int = 0,
+) -> tuple[Callable, dict]:
+    """Load a BIMZ model by identifier.
+
+    Parameters
+    ----------
+    source : str
+        Model identifier — DOI, zenodo URL, BIMZ nickname (e.g.
+        ``"affable-shark"``), or path to a local rdf.yaml.
+    weight_format : str | None
+        One of ``"onnx"``, ``"torchscript"``, ``"pytorch_state_dict"``,
+        ``"tensorflow_saved_model_bundle"``, ``"keras_hdf5"``. None →
+        try ``"onnx"`` then ``"torchscript"`` then whatever else the
+        RDF publishes.
+    device : int
+        CUDA device index. Use ``"cpu"`` to force CPU.
+    """
+    desc = load_description(source)
+
+    if weight_format is None:
+        for candidate in ("onnx", "torchscript"):
+            if candidate in desc.weights.model_dump():
+                weight_format = candidate
+                break
+
+    pipe = create_prediction_pipeline(
+        desc, weight_format=weight_format, devices=[f"cuda:{device}"]
+    )
+
+    info = {
+        "device": f"cuda:{device}",
+        "model_id": str(desc.id),
+        "name": str(desc.name),
+        "weight_format": pipe.weight_format,
+        "input_axes": "".join(a.id for a in desc.inputs[0].axes),
+        "available_weight_formats": list(desc.weights.model_dump().keys()),
+    }
+    processor = partial(_run, pipe=pipe, desc=desc)
+    return processor, info
+
+
+def _run(pixels: numpy.ndarray, pipe, desc) -> numpy.ndarray:
+    axes = tuple(a.id for a in desc.inputs[0].axes)
+    arr = xarray.DataArray(pixels, dims=axes)
+    out = pipe.predict(arr)
+    # Single-output models: return numpy. Multi-output: return first.
+    return out[0].to_numpy()
+
+
+async def main():
+    with pynng.Rep0(listen=address, recv_timeout=300) as sock:
+        print(f"bioimageio server listening on {address}", flush=True)
+        async with trio.open_nursery() as nursery:
+            nursery.start_soon(partial(responder, setup=setup), sock)
+
+
+if __name__ == "__main__":
+    try:
+        trio.run(main)
+    except KeyboardInterrupt:
+        pass

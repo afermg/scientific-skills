@@ -1,0 +1,104 @@
+{
+  # Conda-bootstrap variant. Use this when the upstream model's deps are
+  # conda-forge exclusives (nifty, vigra-py, torch_em, python-elf, etc.) —
+  # i.e. they have no PyPI distribution, and packaging them as proper Nix
+  # derivations is a multi-day effort.
+  #
+  # Pattern: nix shells `micromamba` + cudaPackages only; the `runserver.sh`
+  # bootstraps a conda env from `nix/env-server.yaml` on first run, caches it
+  # to `~/.cache/<MODEL>/mamba/envs/<MODEL>_server`, and runs `server.py`
+  # inside it via `micromamba run`.
+  #
+  # CRITICAL: prepend /run/opengl-driver/lib to LD_LIBRARY_PATH so the
+  # conda-shipped torch sees NixOS's libcuda.so driver stub. Without this,
+  # `torch.cuda.is_available()` returns False even with conda's pytorch-cuda
+  # installed.
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    systems.url = "github:nix-systems/default";
+    flake-utils.url = "github:numtide/flake-utils";
+    flake-utils.inputs.systems.follows = "systems";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      systems,
+      ...
+    }@inputs:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = import nixpkgs {
+          system = system;
+          config = {
+            allowUnfree = true;
+            cudaSupport = true;
+          };
+        };
+        envName = "<MODEL>_server";
+        cacheDir = "$HOME/.cache/<MODEL>";
+        envFile = "${self}/nix/env-server.yaml";
+      in
+      with pkgs;
+      rec {
+        apps.default =
+          let
+            runServer = pkgs.writeScriptBin "runserver.sh" ''
+              #!${pkgs.bash}/bin/bash
+              set -e
+              # CUDA visibility: NixOS driver stub must come first.
+              export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
+              # Disable buffering so server logs surface promptly under `nix run`.
+              export PYTHONUNBUFFERED=1
+              # Steer conda's package cache out of /nix/store.
+              export MAMBA_ROOT_PREFIX=${cacheDir}/mamba
+              ENV_PATH=${cacheDir}/mamba/envs/${envName}
+              if [ ! -d "$ENV_PATH" ]; then
+                mkdir -p ${cacheDir}/mamba
+                ${pkgs.micromamba}/bin/micromamba create -y -p "$ENV_PATH" -f ${envFile}
+                # nahual + pynng come from PyPI (both have wheels).
+                "$ENV_PATH/bin/pip" install nahual pynng
+              fi
+              exec ${pkgs.micromamba}/bin/micromamba run -p "$ENV_PATH" \
+                python ${self}/server.py ''${@:-"ipc:///tmp/<MODEL>.ipc"}
+            '';
+          in
+          {
+            type = "app";
+            program = "${runServer}/bin/runserver.sh";
+          };
+
+        devShells = {
+          default = mkShell {
+            packages = [
+              pkgs.micromamba
+              pkgs.cudaPackages.cudatoolkit
+              pkgs.cudaPackages.cudnn
+            ];
+            shellHook = ''
+              export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
+              export MAMBA_ROOT_PREFIX=${cacheDir}/mamba
+            '';
+          };
+        };
+      }
+    );
+}
+# Companion file: nix/env-server.yaml
+# ----
+# name: <MODEL>_server
+# channels:
+#   - conda-forge
+#   - pytorch
+#   - nvidia
+# dependencies:
+#   - python=3.11
+#   - pytorch
+#   - pytorch-cuda=12.1
+#   - <conda-only deps the model needs>
+#   - pip
+#   - pip:
+#     - <pypi-only extras>

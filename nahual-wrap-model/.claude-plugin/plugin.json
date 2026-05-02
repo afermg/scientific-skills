@@ -1,0 +1,9 @@
+{
+  "name": "nahual-wrap-model",
+  "description": "Wrap a third-party deep learning model (vision/microscopy or single-cell) into a Nix flake exposing a Nahual server: server.py + flake.nix + nix/nahual.nix + basic_test.py + .envrc, GPU-validated, pushed to a fork under afermg.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Alán F. Muñoz",
+    "email": "amunozgo@broadinstitute.org"
+  }
+}

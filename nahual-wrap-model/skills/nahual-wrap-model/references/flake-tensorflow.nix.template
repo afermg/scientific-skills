@@ -1,0 +1,99 @@
+{
+  # TensorFlow variant. Use this when the upstream model is TF/Keras.
+  # Pinned to nixos-24.11 because TF 2.13 isn't packaged on unstable.
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    systems.url = "github:nix-systems/default";
+    flake-utils.url = "github:numtide/flake-utils";
+    flake-utils.inputs.systems.follows = "systems";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      systems,
+      ...
+    }@inputs:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = import nixpkgs {
+          system = system;
+          config = {
+            allowUnfree = true;
+            # cudaSupport=true selects python311-tensorflow-gpu-2.13.0
+            # (separate derivation from the CPU tensorflow). Cold cache
+            # compiles UCC/NCCL/cuda-merged for several hours. Required.
+            cudaSupport = true;
+          };
+        };
+      in
+      with pkgs;
+      rec {
+        # TF 2.13 in nixos-24.11 only supports up to python3.11.
+        pythonForServer = pkgs.python311;
+
+        apps.default =
+          let
+            python_with_pkgs = pythonForServer.withPackages (pp: [
+              packages.nahual
+              pp.tensorflow
+              # tf-keras' wheel METADATA lists `tensorflow` as a runtime dep,
+              # but with cudaSupport=true we ship `tensorflow-gpu` (different
+              # package name, same `tensorflow` import path). Skip the
+              # runtime-deps check to avoid the spurious failure.
+              (pp.tf-keras.overridePythonAttrs (_: { dontCheckRuntimeDeps = true; }))
+              pp.numpy
+              pp.pillow
+              pp.trio
+            ]);
+            runServer = pkgs.writeScriptBin "runserver.sh" ''
+              #!${pkgs.bash}/bin/bash
+              # TF 2.13 expects standalone keras at runtime; tf-keras 2.17 in
+              # legacy mode satisfies the API.
+              export TF_USE_LEGACY_KERAS=1
+              ${python_with_pkgs}/bin/python ${self}/server.py ''${@:-"ipc:///tmp/<MODEL>.ipc"}
+            '';
+          in
+          {
+            type = "app";
+            program = "${runServer}/bin/runserver.sh";
+          };
+
+        packages = {
+          pynng = pythonForServer.pkgs.callPackage ./nix/pynng.nix { };
+          nahual = pythonForServer.pkgs.callPackage ./nix/nahual.nix {
+            pynng = packages.pynng;
+          };
+        };
+
+        devShells = {
+          default =
+            let
+              python_with_pkgs = pythonForServer.withPackages (pp: [
+                packages.nahual
+                pp.tensorflow
+                (pp.tf-keras.overridePythonAttrs (_: { dontCheckRuntimeDeps = true; }))
+                pp.numpy
+                pp.pillow
+                pp.trio
+                pp.scikit-image
+                pp.scikit-learn
+                pp.pyyaml
+              ]);
+            in
+            mkShell {
+              packages = [
+                python_with_pkgs
+                pkgs.cudaPackages.cudatoolkit
+              ];
+              shellHook = ''
+                export PYTHONPATH=${python_with_pkgs}/${python_with_pkgs.sitePackages}:$PYTHONPATH
+              '';
+            };
+        };
+      }
+    );
+}

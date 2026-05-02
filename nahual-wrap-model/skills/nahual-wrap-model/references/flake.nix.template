@@ -1,0 +1,92 @@
+{
+  inputs = {
+    # Default to unstable; fall back to nixos-24.11 if the dep solve is hostile.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    systems.url = "github:nix-systems/default";
+    flake-utils.url = "github:numtide/flake-utils";
+    flake-utils.inputs.systems.follows = "systems";
+    pynng-flake.url = "github:afermg/pynng";
+    pynng-flake.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      systems,
+      ...
+    }@inputs:
+    flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = import nixpkgs {
+          system = system;
+          config = {
+            allowUnfree = true;
+            # GPU is required. Don't set this to false to dodge a slow build.
+            cudaSupport = true;
+          };
+        };
+      in
+      with pkgs;
+      rec {
+        apps.default =
+          let
+            python_with_pkgs = python3.withPackages (pp: [
+              packages.nahual
+              pp.torch
+              pp.torchvision
+              pp.numpy
+              pp.pillow
+              # Add ONLY runtime deps server.py imports. Don't add `timm`
+              # speculatively — it can trigger a 30+ min test rebuild on
+              # unstable.
+            ]);
+            runServer = pkgs.writeScriptBin "runserver.sh" ''
+              #!${pkgs.bash}/bin/bash
+              ${python_with_pkgs}/bin/python ${self}/server.py ''${@:-"ipc:///tmp/<MODEL>.ipc"}
+            '';
+          in
+          {
+            type = "app";
+            program = "${runServer}/bin/runserver.sh";
+          };
+
+        packages = {
+          nahual = pkgs.python3.pkgs.callPackage ./nix/nahual.nix {
+            pynng = inputs.pynng-flake.packages.${system}.pynng;
+          };
+        };
+
+        devShells = {
+          default =
+            let
+              python_with_pkgs = python3.withPackages (pp: [
+                packages.nahual
+                pp.torch
+                pp.torchvision
+                pp.numpy
+                pp.pillow
+                # Dev-only extras
+                pp.tifffile
+                pp.scikit-image
+                pp.scikit-learn
+                pp.pyyaml
+              ]);
+            in
+            mkShell {
+              packages = [
+                python_with_pkgs
+                pkgs.cudaPackages.cudatoolkit
+                # Some PyTorch wraps also want cudnn explicitly:
+                # pkgs.cudaPackages.cudnn
+              ];
+              shellHook = ''
+                export PYTHONPATH=${python_with_pkgs}/${python_with_pkgs.sitePackages}:$PYTHONPATH
+              '';
+            };
+        };
+      }
+    );
+}
