@@ -15,18 +15,31 @@ with nahual cellpose and trackastra GPU servers for segmentation and tracking.
 
 ## Architecture overview
 
-Three components:
+Three layers:
 
-1. **Nahual cellpose servers** -- standalone GPU processes doing cell/nuclei
-   segmentation via IPC sockets (`ipc:///tmp/cellpose{N}.ipc`)
-2. **Nahual trackastra server** -- standalone GPU process for cell tracking
-   via IPC socket (`ipc:///tmp/trackastra.ipc`)
-3. **Pipeline workers** -- joblib parallel workers that read images, send
-   them to nahual servers for segmentation/tracking, then extract
-   morphological features with cp_measure
+1. **Model servers** -- standalone GPU processes that load a single model
+   (Cellpose-SAM, Trackastra, DINOv2, BABY, ViT, SubCell, ...) and expose
+   it behind an nng IPC socket. Each model is its own repo/flake under
+   `afermg/<model>` (e.g. `github:afermg/cellpose`,
+   `github:afermg/trackastra`, `github:afermg/dinov2`). Every server
+   exposes `python server.py ipc:///tmp/<name>.ipc`.
+2. **Nahual transport/client** (`github:afermg/nahual`) -- thin numpy-only
+   transport layer built on pynng. Client side provides
+   `nahual.process.dispatch_setup_process('<model>')` which returns
+   `(setup, process)` functions that serialize dict/numpy payloads to the
+   matching server. No model code lives here; it's pure plumbing.
+3. **ALIBY orchestrator** (`github:afermg/aliby`) -- end-to-end pipelining
+   framework that reads images (TIFF/Zarr), tiles, dispatches to nahual
+   servers for segmentation/tracking, and extracts features via
+   [cp_measure](https://github.com/afermg/cp_measure). Canonical entry
+   points: `aliby.pipe_builder.build_pipeline_steps` +
+   `aliby.pipe.run_pipeline_and_post`. Install via `pip install aliby`,
+   `uv sync --all-groups`, or `nix develop .` from a checkout.
 
-Pipeline entry point: `notebooks/nb01_extract_profiles.py` (marimo notebook).
-The `run_pipelines()` function is importable for scripted runs.
+In this project, the aliby invocation is wrapped in
+`notebooks/nb01_extract_profiles.py` (marimo notebook); its
+`run_pipelines()` function is importable for scripted runs and handles
+per-batch/per-assay iteration on top of aliby.
 
 ## Notebook layout
 
@@ -58,16 +71,35 @@ export LD_LIBRARY_PATH=/run/opengl-driver/lib:$LD_LIBRARY_PATH
 Already fixed in this project's `flake.nix`. Pass it explicitly when
 launching nahual servers via `nix run`.
 
-## Starting nahual servers with `nix run`
+## Starting model servers
 
-Both `nahual_models/cellpose` and `nahual_models/trackastra` flakes expose
-`apps.default` that runs `server.py` with a socket argument. Prefer
-`nix run github:afermg/...` so there are no local checkouts to maintain.
+Each model repo is a standalone Nix flake exposing `server.py`. Per the
+nahual README, the canonical launch pattern is:
 
-### Cellpose servers
+```bash
+nix develop --command bash -c "python server.py ipc:///tmp/<name>.ipc"
+```
 
-Each server loads CellposeSAM (~4 GB VRAM). On 2× RTX A6000 (49 GB each),
-run up to 6 servers per GPU (12 total). Launch each in a `screen` session:
+Against a GitHub flake (no local checkout) the equivalent is `nix run`
+with the flake's default app, or `nix develop github:afermg/<model>
+--command bash -c "python server.py ipc:///tmp/<name>.ipc"`.
+
+Known server repos (pass the appropriate `<name>` to `dispatch_setup_process`):
+
+| Repo | Socket name | `dispatch_setup_process` key |
+|------|-------------|------------------------------|
+| `github:afermg/cellpose` | `cellpose{N}` | `"cellpose"` |
+| `github:afermg/trackastra` | `trackastra` | `"trackastra"` |
+| `github:afermg/baby` | `baby` | `"baby"` |
+| `github:afermg/dinov2` | `dinov2` | `"dinov2"` |
+| `github:afermg/dinov3` | `dinov3` | `"dinov3"` |
+| `github:afermg/nahual_vit` | `vit` | `"vit"` |
+| `github:afermg/SubCellPortable` | `subcell` | `"subcell"` |
+
+### Cellpose servers (segmentation)
+
+Uses Cellpose-SAM, ~4 GB VRAM per instance. On 2× RTX A6000 (49 GB each),
+run up to 6 servers per GPU (12 total). Launch each in a `screen`:
 
 ```bash
 # 6 servers on GPU 0
@@ -75,7 +107,7 @@ for i in $(seq 0 5); do
   screen -dmS cellpose$i bash -c \
     "export LD_LIBRARY_PATH=/run/opengl-driver/lib:\$LD_LIBRARY_PATH && \
      export CUDA_VISIBLE_DEVICES=0 && \
-     nix run github:afermg/nahual_cellpose -- ipc:///tmp/cellpose$i.ipc"
+     nix run github:afermg/cellpose -- ipc:///tmp/cellpose$i.ipc"
 done
 
 # 6 servers on GPU 1
@@ -83,24 +115,32 @@ for i in $(seq 6 11); do
   screen -dmS cellpose$i bash -c \
     "export LD_LIBRARY_PATH=/run/opengl-driver/lib:\$LD_LIBRARY_PATH && \
      export CUDA_VISIBLE_DEVICES=1 && \
-     nix run github:afermg/nahual_cellpose -- ipc:///tmp/cellpose$i.ipc"
+     nix run github:afermg/cellpose -- ipc:///tmp/cellpose$i.ipc"
 done
 ```
 
-### Trackastra server
+If the flake's `apps.default` does not forward args, fall back to:
+`nix develop github:afermg/cellpose --command python server.py ipc:///tmp/cellpose$i.ipc`.
 
-A single instance is enough (tracking is fast):
+### Trackastra server (tracking)
+
+A single instance is enough (tracking is fast, timelapse-only):
 
 ```bash
 screen -dmS trackastra bash -c \
   "export LD_LIBRARY_PATH=/run/opengl-driver/lib:\$LD_LIBRARY_PATH && \
    export CUDA_VISIBLE_DEVICES=1 && \
-   nix run github:afermg/nahual_trackastra -- ipc:///tmp/trackastra.ipc"
+   nix run github:afermg/trackastra -- ipc:///tmp/trackastra.ipc"
 ```
 
-Replace flake URLs with whatever is canonical for your account/org. If the
-exact URL is unknown, fall back to `nix run /path/to/nahual_models/<name>`
-against a local checkout.
+### Pinning a session (long runs)
+
+These jobs outlive an SSH session only if they run under `systemd-run
+--user --scope` or inside `tmux`/`screen` started with
+`systemd-run --user --scope -- screen -dmS ...`. A plain `screen -dmS`
+attached to a login `systemd --user` scope gets SIGTERM'd when the user
+session ends (see journalctl for `user@$UID.service` stop events) --
+this silently kills every cellpose/trackastra/pipeline screen at once.
 
 ### Verifying servers
 
@@ -123,6 +163,8 @@ If setup returns `{}`, the model failed to load -- check the screen session
 for errors (usually CUDA OOM from too many servers on one GPU).
 
 ## Running the pipeline
+
+### This project (nb01 wrapper around aliby)
 
 ```python
 from pathlib import Path
@@ -150,13 +192,42 @@ run_pipelines(
 ```
 
 Key parameters:
-- **ncores**: parallel site workers (joblib). ~18 on a 192-core machine.
+- **ncores**: parallel site workers (joblib loky). The *only* parallelism
+  knob you should tune. See "Parallelism tuning" below.
 - **extract_ncores**: cores for cp_measure feature extraction per site.
+  **Always pin to the box's logical CPU count** (e.g., 192). Per-site
+  extraction parallelizes well inside one process; capping it below the
+  core count under-utilizes CPU during the extract stage, and raising it
+  above the core count buys nothing. Do not vary this between runs.
 - **nahual_addresses**: list of IPC addresses; assigned round-robin to sites.
   **Must match the number of running servers.** Listing addresses that have
   no server behind them causes workers to block forever on `ConnectionRefused`
   retries -- the pipeline hangs with no traceback until OOM or manual kill.
 - **overwrite**: `False` skips already-processed sites.
+
+#### Parallelism tuning
+
+Rule: `extract_ncores` is fixed at the logical CPU count; `ncores` is the
+only dial. To pick `ncores`:
+
+1. **Probe first**. Run a side-output calibration on the heaviest assay
+   (5-channel cellpainting with both nuclei + cell segmentation) with
+   `profiles_path=.../standard_output_probe`, `max_sites=10`, and a
+   conservative `ncores` (e.g., 10). Capture peak per-worker RSS and
+   sustained CPU% from a resource monitor or repeated `ps -o rss,pcpu`.
+2. **Compute the budget**:
+   `ncores = min(target_cpu_cores / per_worker_cpu_cores,
+   mem_budget / per_worker_peak_RSS)`.
+   Aim for ~80% sustained CPU and leave RAM headroom (≤75% of total) so
+   joblib's gather phase doesn't OOM-kill a worker.
+3. **Failure mode hint**: SIGKILL-shaped
+   `joblib.externals.loky.process_executor.TerminatedWorkerError: ...
+   exit codes {SIGKILL(-9)}` with leaked semlock objects on shutdown
+   reads as memory-driven even when system mem looks fine. Drop `ncores`
+   first; do not touch `extract_ncores`.
+
+Rule of thumb on this 192-core / 768 GiB box: `ncores=18-20` is a safe
+default for most assays. Heavy 5-channel cellpainting may need `ncores=12-15`.
 
 Available `(batch, assay)` pairs come from
 `notebooks/nb01_extract_profiles.get_batches_assays()` -- call it to discover
@@ -164,6 +235,63 @@ the valid list for the current dataset instead of hard-coding.
 
 Timelapse assays include trackastra tracking as a global step (uses the
 trackastra server); non-timelapse assays don't need it.
+
+### Canonical aliby usage (outside this project)
+
+Per the aliby README, a standalone run looks like:
+
+```python
+from pathlib import Path
+from aliby.io.dataset import DatasetDir
+from aliby.pipe import run_pipeline_and_post
+from aliby.pipe_builder import build_pipeline_steps
+
+regex = r".*__([A-Z][0-9]{2})__([0-9])__([A-Za-z]+).tif"
+capture_order = "WFC"
+
+dataset = DatasetDir(Path("data/my_experiment"), regex=regex,
+                     capture_order=capture_order)
+positions = dataset.get_position_ids()
+key, path = positions[0]["key"], positions[0]["path"]
+
+pipeline = build_pipeline_steps(
+    channels_to_segment={"nuclei": 1},
+    channels_to_extract=[0, 1],
+    features_to_extract=["intensity", "sizeshape"],
+)
+pipeline["steps"]["tile"]["image_kwargs"] = {
+    "source": {"key": key, "path": path},
+    "regex": regex,
+    "capture_order": capture_order,
+}
+
+result = run_pipeline_and_post(
+    pipeline=pipeline, pipeline_name=key, output_path="results",
+)
+```
+
+Capture groups map filename fields (`W`ell, `F`ield, `C`hannel, `T`ime)
+into aliby's internal TCZYX arrays. See `examples/` in the aliby repo
+for nahual-backed segmentation and embedding variants.
+
+### Direct nahual client (debugging a single server)
+
+```python
+import numpy as np
+from nahual.process import dispatch_setup_process
+
+setup, process = dispatch_setup_process("cellpose")
+address = "ipc:///tmp/cellpose0.ipc"
+
+setup({}, address=address)               # loads model server-side
+img = np.random.randint(0, 255, (1, 128, 128), dtype=np.uint16)
+masks = process(img, address=address)    # (128, 128)
+```
+
+Same pattern for other models -- swap `"cellpose"` for `"trackastra"`,
+`"dinov2"`, `"vit"`, etc., and pass the model's setup parameters dict
+(e.g. DINOv2 wants `{"repo_or_dir": "facebookresearch/dinov2",
+"model": "dinov2_vits14_lc"}`).
 
 ### Without nahual (local cellpose)
 

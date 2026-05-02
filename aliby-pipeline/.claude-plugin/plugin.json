@@ -1,7 +1,7 @@
 {
   "name": "aliby-pipeline",
   "description": "Run the aliby image analysis pipeline with nahual cellpose/trackastra GPU servers for segmentation, tracking, and feature extraction.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": {
     "name": "Alán F. Muñoz",
     "email": "amunozgo@broadinstitute.org"
