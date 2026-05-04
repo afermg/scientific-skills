@@ -3,8 +3,8 @@ name: nahual-wrap-model
 description: >
   Wrap a third-party ML model (typically vision/microscopy or single-cell) as a
   Nahual server: fork the upstream repo to afermg/<repo>, add server.py +
-  flake.nix + nix/nahual.nix + basic_test.py + .envrc, validate it runs on GPU,
-  push, and add a client example to the nahual repo. TRIGGER when: user asks
+  flake.nix + basic_test.py + .envrc + examples/<model>.py, validate it runs
+  on GPU, push to a `nahual-wrap` branch on the fork. TRIGGER when: user asks
   to wrap, port, integrate, or "add a model to nahual"; mentions writing a
   server.py or flake.nix for an ML repo; says things like "make X work as a
   nahual server", "deploy X via nahual", "add X to nahual_models"; or asks how
@@ -41,29 +41,29 @@ covers operations, this one covers authoring.
 ## High-level workflow
 
 1. **Fork upstream → `github:afermg/<repo>`.** Don't push to the original.
-2. **Locally clone** under `/home/amunoz/projects/nahual_models/<repo>/`.
-3. **Add the five required files** (templates in `references/`):
+   Default branch on every afermg fork is `main`. Use `gh repo fork <owner>/<repo> --clone=false` with `GH_TOKEN=$(cat ~/.github_token)`.
+2. **Locally clone** via SSH (HTTPS hangs) into `/home/amunoz/projects/nahual_models/<repo>/`. Create a `nahual-wrap` branch off the upstream default — never push to `main` of the fork unless the upstream itself uses `main`.
+3. **Add five required files at the repo root** (templates in `references/`):
    - `server.py` — Nahual setup/process server
    - `flake.nix` — `apps.default` (`nix run`) + `devShells.default` (`nix develop`)
-   - `nix/nahual.nix` — pin nahual itself as a Python package
-   - `basic_test.py` — standalone smoke test (no IPC, just model + forward)
-   - `.envrc` — single line: `use flake .`
+   - `basic_test.py` — standalone smoke test (no IPC, just model + forward), with the importlib source-shadow guard
+   - `.envrc` — single line: `use flake .` (no `--impure`; `cudaSupport` is set inside the flake, not via env)
+   - `examples/<model>.py` — client demo, in-repo (NOT in the central nahual repo)
+
+   **Do NOT add `nix/nahual.nix`.** Nahual is pulled directly from its remote flake as a flake input — see "Wiring nahual via flake input" below. This was the standard as of 2026-05; older wraps that still ship `nix/nahual.nix` are being migrated.
 4. **Pick a `nixpkgs` channel.** Default to `nixos-unstable`. Fall back to
    `nixos-24.11` only if the model's deps (typically `timm`, `tensorflow`,
-   ancient `transformers`) are too painful on unstable.
+   ancient `transformers`) are too painful on unstable. **Pin a specific commit** when a moving channel triggers a multi-hour torch rebuild — see ultrack's `nixpkgs.url = "github:NixOS/nixpkgs/<sha>";` for the pattern.
 5. **Make GPU work.** `cudaSupport = true` is non-negotiable — even if the TF
    wheel takes 6 hours to build the first time. CPU-only wraps are not
-   acceptable.
+   acceptable. **Conda-only deps must be packaged as proper Nix derivations** — no `micromamba` bootstrap fallback, no matter how heavy the C++ build is (the user has explicitly OK'd >1h cold-cache builds for vigra/nifty/affogato/torch_em).
 6. **Validate twice:**
    - `nix develop --impure --command python basic_test.py` (no IPC)
-   - `nix run --impure .#default -- ipc:///tmp/<name>.ipc` + a client roundtrip
+   - `nix run --impure .#default -- ipc:///tmp/<name>.ipc` + a client roundtrip via the in-repo `examples/<model>.py`
    Both must show `device: cuda:0` (torch) or `device: GPU:0` (TF).
 7. **Push to `git@github.com:afermg/<repo>.git`** (HTTPS hangs — use SSH).
-   Touch only the new files; never overwrite or delete anything from upstream
-   (especially `.github/workflows/`).
-8. **Add a client example** at `/home/amunoz/projects/nahual/examples/<model>.py`,
-   mirroring `dinov2.py`'s style.
-9. **Update the `model-links` branch** of the nahual repo with the new fork URL.
+   Push to a **`nahual-wrap` branch** (or `nahual-wrap-onnx`, `nahual-wrap-<variant>` for alternatives), not to the upstream default branch. Touch only the new files; never overwrite or delete anything from upstream (especially `.github/workflows/`).
+8. **Update the `model-links` branch** of the central `afermg/nahual` repo (read-only catalogue) with the new fork URL — but **do NOT commit anything else to `afermg/nahual`**. Per-model client examples live in their own wrap repos at `examples/<model>.py`, not in `afermg/nahual/examples/`.
 
 ## File anatomy
 
@@ -126,28 +126,71 @@ Use `pynng-flake.url = "github:afermg/pynng"` with
 `pynng-flake.inputs.nixpkgs.follows = "nixpkgs"` so we don't pull a second
 nixpkgs into the closure. Full template: `references/flake.nix.template`.
 
-### `nix/nahual.nix`
+### Wiring nahual via flake input (no `nix/nahual.nix`)
 
-Pins the Nahual transport layer as a Python package. Update `rev` and
-`sha256` only when nahual itself moves. Copy verbatim from
-`references/nahual.nix.template` for new wraps — the only thing that ever
-changes is `version`, `rev`, and `sha256`.
+Nahual itself is pulled directly from its remote flake — do NOT vendor a
+local `nix/nahual.nix`. Add to `inputs`:
+
+```nix
+nahual-flake.url = "github:afermg/nahual";
+nahual-flake.inputs.nixpkgs.follows = "nixpkgs";
+```
+
+The `inputs.nixpkgs.follows = "nixpkgs"` is **load-bearing**. Without it,
+nahual's flake builds against its own pinned nixpkgs (e.g. python 3.13.9),
+and when your wrap uses a different interpreter (e.g. python 3.13.12 from
+the same channel but a slightly different ABI), `python.withPackages`
+*silently drops nahual from the env* — you'll discover it as a missing
+import at runtime, not at build time. Always `follows = "nixpkgs"`.
+
+Then reference the package. Two forms depending on interpreter alignment:
+
+**Form 1 — same python interpreter as nahual builds for** (most common):
+```nix
+python.withPackages (pp: [ inputs.nahual-flake.packages.${system}.nahual pp.torch ... ])
+```
+
+**Form 2 — different python interpreter** (stardist on python3.11 for TF
+2.13; deepprofiler on 3.11; ultrack/micro-sam/nahual_bioimageio with
+`packageOverrides` that fork python's pkgset). Pull nahual's recipe and
+re-`callPackage` against your interpreter's pkgset:
+
+```nix
+nahual = pythonForServer.pkgs.callPackage
+  (inputs.nahual-flake + "/nix/nahual.nix") { pynng = packages.pynng; };
+```
+
+Either way: bumping nahual is a single `nix flake update nahual-flake` —
+no per-wrap edit needed.
 
 ### `basic_test.py`
 
 Smoke test that proves the model loads + forwards inside the dev shell,
-without going through IPC. Pattern:
+without going through IPC. **Always use the importlib source-shadow guard**
+even if the model package doesn't currently have C extensions — it's free
+insurance against a future PyPI version that adds them, and against the
+in-tree `<pkg>/` source dir shadowing the nix-built install:
 
 ```python
-import sys
-if len(sys.argv) < 2:
-    sys.argv.append("ipc:///tmp/<model>_basic_test.ipc")  # placate server.py's argv[1]
+import importlib.util, os, sys
 
-from server import setup
-processor, info = setup()
-print(info)
-out = processor(<small synthetic numpy array>)
-print(type(out), out.shape)
+# Drop the repo root from sys.path BEFORE importing the model — otherwise
+# an in-tree `<pkg>/` source dir can shadow the nix-built package and any
+# compiled C-extension submodule (`<pkg>.lib.<ext>`) is reported missing.
+# Stardist's `stardist.lib.stardist2d` is the canonical example.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path[:] = [p for p in sys.path if os.path.abspath(p) not in {_HERE, ""}]
+
+if len(sys.argv) < 2:
+    sys.argv.append("ipc:///tmp/<model>_basic_test.ipc")
+
+import numpy  # noqa: E402
+
+# Load `server.py` via importlib so we never put _HERE back on sys.path.
+_spec = importlib.util.spec_from_file_location("server", os.path.join(_HERE, "server.py"))
+server = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(server)
+setup = server.setup
 ```
 
 Run with `nix develop --impure --command python basic_test.py`. Template:
@@ -161,8 +204,31 @@ Literally just:
 use flake .
 ```
 
+**No `--impure`.** `cudaSupport = true` and `allowUnfree = true` are set
+inside `flake.nix`'s `import nixpkgs { config = { ... }; }`, so direnv
+doesn't need impure mode. Wraps that historically had `use flake . --impure`
+(trackastra, vit) are being normalized.
+
 If the upstream `.gitignore` excludes `.envrc` (channelsformer did), force-add
 it: `git add -f .envrc`.
+
+### `examples/<model>.py`
+
+The Nahual client demo lives **inside the wrap repo** at `examples/<model>.py`,
+not in the central `afermg/nahual/examples/`. This makes wraps self-documenting
+and keeps the central repo small. Mirror an existing wrap's example
+(`dinov2/examples/dinov2.py` or `trackastra/examples/trackastra.py`) for the
+imports + `dispatch_setup_process(...)` call. For models whose name isn't in
+nahual's built-in registry (most new wraps), pass
+`signature=("dict", "numpy")` explicitly.
+
+**Multi-model wraps (vit, nahual_bioimageio):** when one repo serves several
+models (e.g. ViT serves OpenPhenom and MorphEM, bioimageio serves any RDF),
+ship one example *per model identifier* — `examples/openphenom.py`,
+`examples/morphem.py`, etc. — not a single combined file. The flake's
+`runserver.sh` typically points at a single dispatching `server.py` (or, for
+ViT, separate per-model entry points under `src/vit/`); the examples cover the
+client-side variations.
 
 ## Picking the nixpkgs channel
 
@@ -184,8 +250,11 @@ Ultrack does this: `nixpkgs.url = "github:NixOS/nixpkgs/<sha>";` pinned to
 the same commit cellpose/trackastra use, so the cached CUDA torch is
 hit. Document the rationale in a comment above the URL.
 
-**Override numba's pytestCheckPhase** when a custom Python override forces
-numba to rebuild — its test suite is 30+ minutes serial. Pattern from ultrack:
+**Override numba's pytestCheckPhase** when a custom Python override or
+`cudaSupport = true` forces numba to rebuild — its test suite is 30+
+minutes serial. The same trap exists for `numbagg`, `xarray`, and
+`imagecodecs` once they're in the closure (each pytest takes 30 min to 2 h
+on contended hosts). Pattern from ultrack / nahual_bioimageio:
 ```nix
 python = pkgs.python313.override {
   packageOverrides = pyfinal: pyprev: {
@@ -193,6 +262,7 @@ python = pkgs.python313.override {
       doCheck = false; doInstallCheck = false;
       pytestCheckPhase = "true"; installCheckPhase = "true";
     });
+    # Apply the same to numbagg / xarray / imagecodecs / etc. as needed.
   };
 };
 ```
@@ -260,8 +330,15 @@ flag. Smoke test should report `device: GPU:0`.
 | `napari.utils...` ImportError pulled in via the model's package | Upstream's `__init__.py` eagerly imports napari for GUI hooks | Don't import the top-level package; import the specific inference submodule (`micro_sam.automatic_segmentation`, `cyto_dl.models.im2im` etc.). Set `try: from napari... except ImportError: ...` is upstream's pattern — match it. |
 | `setuptools_scm` / `hatch-vcs` complains about no version | Source tarball in nix sandbox has no git tag visible | Set `SETUPTOOLS_SCM_PRETEND_VERSION=<x.y.z>` and `HATCH_BUILD_HOOKS_ENABLE=false` in the package's `nativeBuildInputs` env. |
 | `pyproject.toml` `[tool.hatch.build.targets.wheel] sources = [...]` flattens namespace | Upstream's wheel layout strips the package prefix (EmbedSeg pattern) | `postPatch = "substituteInPlace pyproject.toml --replace-fail 'sources = [\"<Pkg>\"]' ''"` |
-| Conda-only deps (`nifty`, `vigra`, `torch_em`, `python-elf`) | No PyPI distributions; nixpkgs Python packages don't exist | Fall back to a `micromamba`-bootstrapped conda env *inside* the flake; nix shells `micromamba` + `cudaPackages.cudatoolkit` + `cudnn` only. See micro-sam wrap. Document the cold-cache 3-4 min env solve. Always prepend `/run/opengl-driver/lib` to `LD_LIBRARY_PATH` in the wrapper for CUDA visibility. |
+| Conda-only deps (`nifty`, `vigra`, `torch_em`, `python-elf`, `affogato`) | No PyPI distributions; nixpkgs Python packages don't exist | Package them as proper Nix derivations from upstream sources. **Do NOT fall back to micromamba** — the user has explicitly rejected conda bootstraps even for multi-hour cold-cache C++ builds. See micro-sam (`nix/{vigra,nifty,affogato,torch_em,python_elf}.nix`) for the concrete recipes. |
 | ILP / Gurobi-style solver in upstream means "GPU mandatory" doesn't fit | Some tools (ultrack) have a CPU-bound combinatorial core | Run the *learning* parts on GPU and document honestly which steps are CPU. Don't ship CPU-only torch when the underlying detection nets *can* use GPU. |
+| `cmake_minimum_required(VERSION <3.5)` rejected by cmake 4 | nixpkgs unstable's cmake bumped to 4; many older C++ libs (xtensor 0.25, xtl 0.7.7, affogato 0.3.x, nifty 1.2.x) target older cmake versions | Add `cmakeFlags = [ "-DCMAKE_POLICY_VERSION_MINIMUM=3.5" ];` to the derivation. |
+| `xtensor 0.27` removes `svector(begin, end)` constructor that affogato/nifty rely on, AND introduces C++20 `concept` syntax | Upstream `xtensor` flag day | Pin `xtensor 0.25.0` + `xtl 0.7.7` + `xtensor-python 0.27.0` (the combo nixos-24.11 ships) via a custom `nix/xtensor_pinned.nix`; affogato pinned to `0.3.3` and nifty to `1.2.3` (later versions migrated to `xtensor/containers/...` includes that need 0.27). |
+| `vigranumpy` Python bindings missing despite `pkgs.vigra` being installed | nixpkgs' `vigra` derivation builds boost without python support, silently disabling vigranumpy | Override boost-with-python and `toPythonModule`-wrap vigra. ~30-line `nix/vigra.nix`. |
+| affogato 0.3.3 CMake uses removed `distutils.sysconfig.get_python_lib()` | Custom `FindNUMPY.cmake` + `FindPythonPyEnv.cmake` pre-date Python 3.12 | `postPatch` to replace both with modern `find_package(Python COMPONENTS NumPy Interpreter Development)` + `find_package(pybind11 CONFIG REQUIRED)`. Drop the `learning` subdir if it hits xtensor `operator/=` ambiguity (elf/micro_sam never call into it). |
+| csbdeep raises "Starting with TF 2.6.0, a recent stand-alone keras package is required" | csbdeep does a raw `from keras import __version__` AND uses `_KERAS = 'tensorflow.keras'`, neither of which honor `TF_USE_LEGACY_KERAS` | `postPatch` in `nix/csbdeep.nix` to substitute `from keras` → `from tf_keras` AND `_KERAS = 'keras' if (IS_TF_1 or IS_KERAS_3_PLUS) else 'tensorflow.keras'` → `_KERAS = 'tf_keras'`. See afermg/stardist `nix/csbdeep.nix`. |
+| Auth-gated weights (CellSAM `DEEPCELL_ACCESS_TOKEN`) | Upstream weight download requires a deepcell account | Document the env var; AND check HuggingFace for a community ONNX export (`keejkrej/cellsam-onnx`) that bypasses the auth — wrap it on a separate `nahual-wrap-onnx` branch using `onnxruntime` to orchestrate `image_encoder + cellfinder + mask_decoder + image_pe`. The original auth path stays on `nahual-wrap`. |
+| One server can't load multiple models in sequence | Pre-0.0.9 `nahual.server.responder` only ran setup on the first dict message; subsequent dicts crashed `deserialize_numpy` | Bump the wrap's `nahual-flake` input to >= 0.0.9 (commit `dd58a250` or later). Dispatch is now by payload type — dict ⇒ setup, numpy ⇒ process. |
 
 ## Validation workflow
 
@@ -296,24 +373,26 @@ After local validation:
 
 1. **Verify you didn't touch CI.** Run `git diff --stat` against the upstream
    default branch — your changes should be limited to: `server.py`,
-   `flake.nix`, `flake.lock`, `nix/`, `basic_test.py`, `.envrc`, and at most
-   a tiny README note. If `.github/workflows/` shows up in the diff, revert
-   it. (Cellpose, dinov2, dinov3, trackastra all have upstream workflows
-   that must stay intact.)
+   `flake.nix`, `flake.lock`, `nix/`, `basic_test.py`, `.envrc`,
+   `examples/<model>.py`, and at most a tiny README note. If
+   `.github/workflows/` shows up in the diff, revert it. (Cellpose, dinov2,
+   dinov3, trackastra all have upstream workflows that must stay intact.)
 
-2. **Push to the fork** (SSH only):
+2. **Push to a `nahual-wrap` branch** on the fork (SSH only):
    ```bash
    git remote set-url origin git@github.com:afermg/<repo>.git
-   git push -u origin <branch>
+   git checkout -b nahual-wrap   # or nahual-wrap-onnx for variants
+   git push -u origin nahual-wrap
    ```
+   Don't push to the upstream's default branch — keep the wrap on its own
+   branch so users still see the upstream's `main` / `master` when they
+   land on the repo.
 
-3. **Add the client example.** Mirror `dinov2.py`'s structure, located at
-   `/home/amunoz/projects/nahual/examples/<model>.py`. Image models use 5-D
-   `NCZYX` random data; non-image models pass `signature=("dict", "numpy")`
-   explicitly to `dispatch_setup_process` because their name isn't in the
-   built-in registry.
+3. **The client example is already in the wrap repo** at `examples/<model>.py`
+   (per "File anatomy" above). No copy in the central nahual repo.
 
-4. **Update the `model-links` branch** on `github:afermg/nahual`:
+4. **Update the `model-links` branch** on `github:afermg/nahual` (the only
+   place changes to nahual itself are allowed):
    ```bash
    cd /home/amunoz/projects/nahual
    git fetch origin model-links
@@ -321,8 +400,13 @@ After local validation:
    # add a row to README.md under the appropriate section
    git add README.md && git commit -m "docs: add <model> wrap link"
    git push origin model-links
-   git switch -                                 # back to your previous branch
+   git switch -
    ```
+
+   **Do NOT push to nahual's `master` / `main`** — the user has explicitly
+   forbidden direct master pushes. Anything beyond the model-links README
+   row goes on a separate branch (e.g. `clean-trailers`, `dedupe-examples`)
+   for the user to fast-forward themselves.
 
    If a model was *considered but rejected*, document the why in the
    "Considered but not wrapped" section (e.g. cytoself produces a spatial
@@ -349,32 +433,63 @@ codebook map), it doesn't fit the Nahual contract and shouldn't be wrapped
 ## When upstream isn't easily nixified
 
 Some packages aren't on PyPI or have C++ deps (vigra, nifty, gurobi) that
-nobody has packaged for nixpkgs. Three escape hatches in order of preference:
+nobody has packaged for nixpkgs. Two escape hatches:
 
-1. **Write your own `nix/<pkg>.nix`** that fetches a PyPI tarball and
-   declares deps manually — the EmbedSeg, InstanSeg, Ultrack, and CellSAM
+1. **Write your own `nix/<pkg>.nix`** that fetches the upstream source
+   (PyPI for pure-Python, GitHub tag for C++ libraries) and declares deps
+   manually — the EmbedSeg, InstanSeg, Ultrack, CellSAM, and micro-sam
    wraps all do this. Set `dontCheckRuntimeDeps = true` to skip wheel
    metadata mismatches and `pythonRuntimeDepsCheck = false` for older
    nixpkgs. List only the deps that the *server* import path actually pulls
    in (not the entire pyproject `dependencies` list — many are unused at
    inference time).
-2. **micromamba bootstrap inside the flake** when the dep is conda-only
-   (vigra-py, nifty, torch_em, python-elf — all conda-forge exclusives).
-   Pattern from micro-sam wrap: nix shells `micromamba` + cudaPackages, the
-   `runserver.sh` does `micromamba create -p ~/.cache/<model>/env -y -f
-   nix/env-server.yaml` on first run, then `micromamba run -p <env>
-   python server.py ...`. Cold cache: ~3-4 min env solve, ~4 GB download;
-   subsequent runs reuse the env. **Critical**: prepend
-   `/run/opengl-driver/lib` to `LD_LIBRARY_PATH` in `runserver.sh` so the
-   conda-shipped torch sees NixOS's `libcuda.so` driver stub.
-3. **Generic loader wraps** for model-zoo packages (`bioimageio.core`).
+
+   For **C++ Python bindings** (vigra-numpy, nifty, affogato), expect to
+   write 50-150 line derivations that handle: a `boost-with-python`
+   override (vigra), `cmakeFlags = [ "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"
+   "-DBUILD_TESTS=OFF" ]`, a pinned older xtensor stack
+   (`nix/xtensor_pinned.nix`), `postPatch` to substitute the
+   distutils-using `Find*.cmake` modules with modern `find_package(Python
+   COMPONENTS NumPy ...)`, and a substitute on
+   `install(... DESTINATION ${Python_SITELIB})` to redirect to
+   `${out}/${python.sitePackages}`. micro-sam's `nix/{vigra,nifty,
+   affogato,torch_em,python_elf,xtensor_pinned}.nix` are the canonical
+   example — copy them as a starting point.
+
+   **The user has explicitly forbidden the micromamba/conda fallback**
+   even when proper nixification takes >1h cold cache. If you find
+   yourself reaching for `micromamba`, stop and write the Nix derivation
+   instead.
+
+2. **Generic loader wraps** for model-zoo packages (`bioimageio.core`).
    One server, accepts a model identifier (`"affable-shark"`, a DOI, a
    zenodo URL, a local rdf.yaml) at `setup()` time. Default to ONNX or
    TorchScript weight formats (self-contained — no `architecture.source`
    import is needed). Tier-2 flake outputs (`apps.with-stardist`,
    `apps.with-careamics`, `apps.with-monai`) for the popular
    custom-architecture families share one `server.py`. See the
-   `nahual_bioimageio` wrap.
+   `nahual_bioimageio` wrap. Each tier-2 variant must build cleanly (no
+   `pp.<missing-pkg>` references); package the Python deps yourself if
+   nixpkgs doesn't ship them.
+
+## Multi-model on one server (nahual >= 0.0.9)
+
+Since nahual 0.0.9 the responder dispatches by payload type — a dict-shaped
+incoming message re-runs `setup()` (replacing the processor in place);
+numpy-shaped messages go to `process()`. This means a single long-lived
+server can host many models in sequence: just call setup again with a new
+identifier dict.
+
+The wire format is unchanged, so older clients keep working. To take
+advantage, bump the wrap's `nahual-flake` input:
+
+```bash
+nix flake update nahual-flake
+```
+
+If your wrap still pins `nix/nahual.nix` directly, replace it with the
+flake-input pattern (see "Wiring nahual via flake input" above) so future
+nahual bumps are a single `nix flake update`.
 
 ## Reference templates
 
