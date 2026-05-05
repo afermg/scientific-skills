@@ -12,30 +12,26 @@ Expected output:
     type and shape of process() result, with cuda:0 device.
 """
 
-import importlib.util
 import os
 import sys
-
-# Drop the repo root from sys.path BEFORE importing the model — otherwise an
-# in-tree `<MODEL>/` source dir can shadow the nix-built package and any
-# compiled C-extension submodule (`<pkg>.lib.<ext>`) is reported missing.
-# Stardist's `stardist.lib.stardist2d` is the canonical example.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:] = [p for p in sys.path if os.path.abspath(p) not in {_HERE, ""}]
 
 # server.py reads sys.argv[1] at import time; inject a placeholder so
 # importing it from this file doesn't crash.
 if len(sys.argv) < 2:
     sys.argv.append("ipc:///tmp/<MODEL>_basic_test.ipc")
 
-import numpy  # noqa: E402
+# PYTHONSAFEPATH=1 (set in flake's runServer/devShell) prevents Python from
+# prepending the script's directory to sys.path. This stops the in-tree
+# `<MODEL>/` source dir from shadowing the nix-built package and any
+# compiled C-extension submodule (`<pkg>.lib.<ext>`). We still want
+# `server.py` (a top-level file in the repo, not part of the model package)
+# to be importable, so APPEND the script dir at the *tail* of sys.path —
+# nix-store packages keep priority and the source-dir shadow stays off the
+# import path.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Load `server.py` directly via importlib so we never need to put _HERE back
-# on sys.path (which would re-trigger the source-dir shadow).
-_spec = importlib.util.spec_from_file_location("server", os.path.join(_HERE, "server.py"))
-server = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(server)
-setup = server.setup
+import numpy  # noqa: E402
+from server import setup  # noqa: E402
 
 
 def main() -> None:
@@ -45,7 +41,7 @@ def main() -> None:
         f"Not on GPU! info['device']={info['device']!r}"
     )
 
-    # Image embedding model: 5-D NCZYX. Adjust shape to model's expectation.
+    # Image embedding model: 5-D NCZYX. Adjust shape to the model's expectation.
     numpy.random.seed(0)
     data = numpy.random.random_sample((2, 3, 1, 224, 224)).astype(numpy.float32)
     out = processor(data)

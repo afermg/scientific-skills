@@ -166,32 +166,37 @@ no per-wrap edit needed.
 ### `basic_test.py`
 
 Smoke test that proves the model loads + forwards inside the dev shell,
-without going through IPC. **Always use the importlib source-shadow guard**
-even if the model package doesn't currently have C extensions — it's free
-insurance against a future PyPI version that adds them, and against the
-in-tree `<pkg>/` source dir shadowing the nix-built install:
+without going through IPC. **The canonical anti-source-shadow tactic is
+`PYTHONSAFEPATH=1` set in the flake** (in both `runServer` and the dev
+shell `shellHook`); `basic_test.py` itself stays simple:
 
 ```python
-import importlib.util, os, sys
-
-# Drop the repo root from sys.path BEFORE importing the model — otherwise
-# an in-tree `<pkg>/` source dir can shadow the nix-built package and any
-# compiled C-extension submodule (`<pkg>.lib.<ext>`) is reported missing.
-# Stardist's `stardist.lib.stardist2d` is the canonical example.
-_HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path[:] = [p for p in sys.path if os.path.abspath(p) not in {_HERE, ""}]
+import os, sys
 
 if len(sys.argv) < 2:
     sys.argv.append("ipc:///tmp/<model>_basic_test.ipc")
 
-import numpy  # noqa: E402
+# PYTHONSAFEPATH=1 (set in flake's runServer/devShell) keeps Python from
+# prepending the script's directory to sys.path — that's what would
+# otherwise let an in-tree `<pkg>/` source dir shadow the nix-built
+# compiled package. We still want `server.py` (a top-level file in the
+# repo, not part of the model package) to be importable, so APPEND the
+# script dir at the *tail* of sys.path. Nix-store packages keep priority;
+# the source-dir shadow stays off the import path.
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-# Load `server.py` via importlib so we never put _HERE back on sys.path.
-_spec = importlib.util.spec_from_file_location("server", os.path.join(_HERE, "server.py"))
-server = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(server)
-setup = server.setup
+import numpy  # noqa: E402
+from server import setup  # noqa: E402
 ```
+
+`PYTHONSAFEPATH=1` alone isn't enough — it removes the script's dir from
+`sys.path[0]`, which would also break `from server import setup` (since
+`server.py` lives next to `basic_test.py`). The `sys.path.append` at the
+*tail* puts it back without re-introducing the priority shadow.
+
+For Python ≤3.10 (rare in this codebase), `PYTHONSAFEPATH` is ignored —
+fall back to the importlib `spec_from_file_location` guard pattern (see
+older commits or templates).
 
 Run with `nix develop --impure --command python basic_test.py`. Template:
 `references/basic_test.py.template`.
@@ -324,7 +329,8 @@ flag. Smoke test should report `device: GPU:0`.
 | `setup()` returns `{}` on the client | Server crashed processing the request | Read the server's stdout — usually a CUDA OOM or missing weight file |
 | Transient `CUDA error: an illegal memory access was encountered` | GPU contention from another process; not a bug in the wrap | Re-check that `device: cuda:0` is in setup info; rerun |
 | `.envrc` not picked up by direnv after git add | Upstream `.gitignore` ignores it (channelsformer) | `git add -f .envrc` |
-| `ModuleNotFoundError: <pkg>.lib.<ext>` when running basic_test from the repo root | The in-tree source dir shadows the nix-built C-extension package (stardist, anything with a compiled `.so`) | Load `server.py` via `importlib.util.spec_from_file_location` instead of `from server import setup`, and remove the repo dir from `sys.path` first. See `references/basic_test-import-shadow.py.template`. |
+| `ModuleNotFoundError: <pkg>.lib.<ext>` when running basic_test from the repo root | The in-tree source dir shadows the nix-built C-extension package (stardist, anything with a compiled `.so`) | Set `PYTHONSAFEPATH=1` in `runServer` AND `devShells.default.shellHook`. Then in `basic_test.py` use `sys.path.append(os.path.dirname(os.path.abspath(__file__)))` (note: **append**, not insert/prepend) so `server.py` is importable but the source-dir shadow stays off the priority path. Pre-Python-3.11 fallback: `importlib.util.spec_from_file_location` to load `server.py` without putting the dir on sys.path. |
+| `ModuleNotFoundError: <pkg>` when running `python -c "import <pkg>"` from inside the repo (cellpose, dinov2, dinov3, trackastra) | `python -c` mode prepends `''` (cwd) to sys.path; the in-tree source dir of the same name as the nix-built package shadows it. Older wraps masked this by `export PYTHONPATH=${python_with_pkgs}/${python_with_pkgs.sitePackages}` putting nix-store first. | Drop the redundant PYTHONPATH (it's duplicating what `python.withPackages` already does) and set `PYTHONSAFEPATH=1` instead. |
 | `ValueError: <something>_TOKEN not found` (cellSAM auth, hub-gated weights) | Upstream weight download is auth-gated (deepcell, HuggingFace private model) | Document the env var the user must set; don't try to bypass auth. Confirm server boots correctly otherwise. |
 | `[Errno 30] Read-only file system` when downloading weights at `setup()` time | Upstream tries to write into the package dir (e.g. instanseg writes to `<pkg>/bioimageio_models/`), but the package lives in `/nix/store` | Set the upstream's cache-path env var (`INSTANSEG_BIOIMAGEIO_PATH`, `MICROSAM_CACHEDIR`, `XDG_CACHE_HOME`, etc.) in `runserver.sh` to a writable `~/.cache/<model>/` dir; `mkdir -p` it first. |
 | `napari.utils...` ImportError pulled in via the model's package | Upstream's `__init__.py` eagerly imports napari for GUI hooks | Don't import the top-level package; import the specific inference submodule (`micro_sam.automatic_segmentation`, `cyto_dl.models.im2im` etc.). Set `try: from napari... except ImportError: ...` is upstream's pattern — match it. |
@@ -490,6 +496,40 @@ nix flake update nahual-flake
 If your wrap still pins `nix/nahual.nix` directly, replace it with the
 flake-input pattern (see "Wiring nahual via flake input" above) so future
 nahual bumps are a single `nix flake update`.
+
+## BIMZ landscape (validated 2026-05)
+
+The `nahual_bioimageio` generic loader has been GPU-validated against 38
+BIMZ entries. Lessons that matter for wrapping or troubleshooting:
+
+- **TorchScript dominates BIMZ.** Of 28 `default`-variant entries, 25
+  `torchscript` / 2 `onnx` / 1 `pytorch_state_dict`. The
+  `onnx → torchscript → pytorch_state_dict` auto-fallback in
+  `_WEIGHT_FORMAT_PRIORITY` is what makes `default` cover most of the zoo.
+- **TF 1.15 SavedModels DO load** through `apps.with-stardist`'s TF 2.21
+  / Keras 3 stack via `bioimageio.core 0.10.2`'s `TFSMLayer` route.
+  Earlier docs claiming they were unloadable were wrong. Only StarDist-
+  *postprocessing-graph* RDFs (`chatty-frog`, `fearless-crab`,
+  `modest-octopus`) still fail there; use the dedicated `afermg/stardist`
+  wrap (TF 2.13 / Python 3.11) for those.
+- **`pytorch_state_dict`-only RDFs CAN run on `default`** when the
+  architecture script (`unet.py`, etc.) has no extra Python deps —
+  `bioimageio.core` fetches and `exec()`s it at load time.
+  `amiable-crocodile`, `passionate-t-rex`, `independent-shrimp` and
+  `impartial-shrimp` are all examples.
+- **No MONAI-published RDFs in BIMZ's queryable collection** at the time
+  of writing — `with-monai` builds but has no zoo entry to validate
+  against. Same for CAREamics (only `jolly-ox` exists).
+- **v0_4 RDFs that use `ScaleLinearKwargs(axes=...)` postprocessing are
+  not loadable** by `bioimageio.core 0.10.2` (e.g. `joyful-deer`,
+  `straightforward-crocodile`). Document them as dropped if you encounter
+  them; await a v0_5 republish.
+
+When wrapping a *specific* BIMZ model that has a release life of its own,
+prefer a dedicated wrap (`afermg/<model>`) over the generic loader — you
+get tighter dep pinning, in-repo examples, and a working `nix run
+github:afermg/<model>` without the `?ref=` dance. Use `nahual_bioimageio`
+for the long tail and one-off explorations.
 
 ## Reference templates
 

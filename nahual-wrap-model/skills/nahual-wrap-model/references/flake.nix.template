@@ -5,6 +5,13 @@
     systems.url = "github:nix-systems/default";
     flake-utils.url = "github:numtide/flake-utils";
     flake-utils.inputs.systems.follows = "systems";
+    # Pull nahual + pynng straight from their flakes — no nix/nahual.nix or
+    # nix/pynng.nix vendored locally. follows = "nixpkgs" is LOAD-BEARING:
+    # without it, nahual builds against its own pinned python interpreter
+    # and python.withPackages silently drops it from a wrap that uses a
+    # different python ABI.
+    nahual-flake.url = "github:afermg/nahual";
+    nahual-flake.inputs.nixpkgs.follows = "nixpkgs";
     pynng-flake.url = "github:afermg/pynng";
     pynng-flake.inputs.nixpkgs.follows = "nixpkgs";
   };
@@ -34,7 +41,7 @@
         apps.default =
           let
             python_with_pkgs = python3.withPackages (pp: [
-              packages.nahual
+              inputs.nahual-flake.packages.${system}.nahual
               pp.torch
               pp.torchvision
               pp.numpy
@@ -45,6 +52,13 @@
             ]);
             runServer = pkgs.writeScriptBin "runserver.sh" ''
               #!${pkgs.bash}/bin/bash
+              # PYTHONSAFEPATH=1 (Python 3.11+) prevents Python from
+              # prepending the script's directory to sys.path. This stops
+              # the in-tree `<MODEL>/` source dir at ${self} from shadowing
+              # the nix-built compiled package — same source-shadow trap
+              # that `from server import setup` would otherwise hit when
+              # basic_test.py runs.
+              export PYTHONSAFEPATH=1
               ${python_with_pkgs}/bin/python ${self}/server.py ''${@:-"ipc:///tmp/<MODEL>.ipc"}
             '';
           in
@@ -53,17 +67,11 @@
             program = "${runServer}/bin/runserver.sh";
           };
 
-        packages = {
-          nahual = pkgs.python3.pkgs.callPackage ./nix/nahual.nix {
-            pynng = inputs.pynng-flake.packages.${system}.pynng;
-          };
-        };
-
         devShells = {
           default =
             let
               python_with_pkgs = python3.withPackages (pp: [
-                packages.nahual
+                inputs.nahual-flake.packages.${system}.nahual
                 pp.torch
                 pp.torchvision
                 pp.numpy
@@ -82,8 +90,12 @@
                 # Some PyTorch wraps also want cudnn explicitly:
                 # pkgs.cudaPackages.cudnn
               ];
+              # Don't `export PYTHONPATH=…sitePackages` — `python.withPackages`
+              # already wraps the python binary with its site-packages on the
+              # import path. The redundant export was masking source-shadow
+              # bugs in older wraps; PYTHONSAFEPATH=1 is the correct fix.
               shellHook = ''
-                export PYTHONPATH=${python_with_pkgs}/${python_with_pkgs.sitePackages}:$PYTHONPATH
+                export PYTHONSAFEPATH=1
               '';
             };
         };
