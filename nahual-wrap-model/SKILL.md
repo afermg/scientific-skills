@@ -1,0 +1,1 @@
+skills/nahual-wrap-model/SKILL.md
