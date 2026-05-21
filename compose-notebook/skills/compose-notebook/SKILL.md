@@ -243,6 +243,41 @@ and avoids stale output issues.
 - **Don't mix `sys.path` hacks with installed packages.** If `aliby` is
   in the `# /// script` dependencies, it's importable directly. Adding
   `../src` to `sys.path` creates version conflicts and import confusion.
+- **`mo.ui.dropdown(options=dict, value=…)` wants the *label*, not the
+  underlying value.** When `options` is a dict, the keys are the dropdown
+  labels and the values are what `dropdown.value` resolves to. The
+  `value=` parameter must match one of the **keys**. Passing the
+  underlying mapping value (e.g. an int) raises `ValueError: The option
+  name 'N' is not a valid option.` The trap: most other `mo.ui.*` widgets
+  accept the underlying value, so muscle memory misleads you.
+- **`alt.Chart(big_df.to_pandas())` serialises every column.** A UMAP
+  scatter over a 240-col profiles frame produces a ~25 MB vega spec,
+  which marimo refuses to render (`Your output is too large …`). Always
+  `df.select([cols_used_by_the_chart]).to_pandas()` before passing into
+  Altair — typically 2-3 orders of magnitude smaller. Same trap with
+  `unpivot()` for facet panels: pre-select the columns you actually face.
+- **`alt.Chart(...).facet(facet=alt.Facet("x:N"), columns=N)` — `columns`
+  belongs on `.facet()`, not on `alt.Facet()`.** vega-lite accepts
+  `columns` only at the facet-composition layer; nested inside
+  `alt.Facet(...)` it raises `Facet has no parameter named 'columns'`.
+- **Polars `.select(list_of_cols)` errors on duplicates.** When you
+  build a column list from a UI dropdown + tooltip list + color encoding
+  and the same name appears more than once,
+  `DuplicateError: the name 'X' is duplicate` fires. Pre-deduplicate with
+  `list(dict.fromkeys(cols))` to preserve order *and* drop repeats.
+- **Don't run formatters (`ruff format`, `black`, `treefmt`, `nix fmt`)
+  while a marimo kernel is editing the same file.** The kernel owns the
+  on-disk `.py` while running; a parallel formatter overwrites your
+  live `code_mode` edits silently. Stop the kernel first, format, then
+  restart. The reverse trap also applies: `code_mode` edits a cell in
+  the kernel's memory but the disk file may briefly disagree until the
+  kernel autosaves — don't read the file expecting kernel state.
+- **Marimo only accepts a parquet column name as a key, not an index.**
+  If your aggregation step renames feature columns to positional aliases
+  (e.g. duckdb `AVG(COLUMNS('.*/.*')) AS "avg"` produces `avg`, `avg_1`,
+  `avg_2`, …), downstream notebooks lose channel identity. Either keep
+  the original names through the aggregation, or re-load the per-cell
+  parquets when channel-keyed columns matter.
 
 ## Process for a new composition
 
