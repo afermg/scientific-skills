@@ -278,6 +278,77 @@ and avoids stale output issues.
   `avg_2`, …), downstream notebooks lose channel identity. Either keep
   the original names through the aggregation, or re-load the per-cell
   parquets when channel-keyed columns matter.
+- **jupyter-scatter inside marimo: six traps stack on top of each
+  other, and skipping any one leaves the plot looking broken.**
+  1. `scatter.show()` / `scatter.widget` returns a `JupyterScatter`
+     whose default MIME bundle is the traditional Jupyter-widget type
+     (`application/vnd.jupyter.widget-view+json`). marimo silently
+     refuses to render that — the cell renders blank. Wrap with
+     `mo.ui.anywidget(scatter.widget)` so marimo treats it as the
+     anywidget it actually is.
+  2. `Scatter.__init__` defaults `_opacity_by='density'`. A subsequent
+     `.opacity(default=0.85)` flips `_opacity_by` back to `None` but
+     does **not** clear the 256-stop `_opacity_map` that was seeded
+     during the density init. Widget construction then prefers the
+     truthy map over the scalar default, and points render with a
+     density ramp (mostly near-zero alpha — "invisible until I select
+     them"). After `.opacity(...)` and before reading `.widget`, force
+     the scalar path with `scatter._opacity_map = None`.
+  3. `opacity_unselected` defaults to `0.5` and multiplies the alpha of
+     every point *not* in the selection set the moment any point is
+     selected. Combined with the density-ramp bug above this looks
+     identical, but it bites independently — e.g. a stray lasso. Pass
+     `.opacity(default=…, unselected=1.0)` to disable selection-state
+     dimming entirely. Reach for `opacity_unselected < 1` only when you
+     actively want selection-driven contrast.
+  4. `.color(by="categorical_str_col")` calls `sum()` on the colour
+     column to detect NaNs. For object/string columns with any `None`,
+     `sum(['x', None, ...])` raises
+     `TypeError: can only concatenate str (not "NoneType") to str` and
+     the chart cell errors out, leaving everything downstream
+     undefined. Filter null rows from the colour column *before*
+     handing the DataFrame to jscatter:
+     `df.filter(pl.col(color_col).is_not_null())`.
+  5. **Mutating `widget.selection` / `widget.filter` from a downstream
+     cell races with WebGL init and silently kills the renderer.** If
+     a separate cell assigns to these traits while jscatter is still
+     standing up its WebGL canvas (or even on a freshly recreated
+     widget, before the frontend has bound the new model_id), the
+     instance ends up in a broken state for its entire lifetime — the
+     Python traits look fine but the canvas is blank, the lasso
+     doesn't work, and clearing the trait back to `None` does not
+     recover. The fix: **bake selection/filter into the widget at
+     construction time** via `scatter.selection(idx)` /
+     `scatter.filter(idx)` chained *before* reading `.widget`. Every
+     change to the picker/filter input rebuilds the chart cell, which
+     constructs a fresh widget with the right state from the start —
+     no post-mutation, no race. If you must mutate after the fact (eg.
+     "clear on empty after a pick"), only do it when the trait
+     actually has content, so a freshly-built widget is never touched.
+  6. **`mo.ui.anywidget(widget).value` reacts to every synced trait,
+     including `hovered_point`.** A downstream cell that reads
+     `chart.value['selection']` (or any other key) re-runs whenever
+     `chart.value` changes — and jscatter updates `hovered_point` on
+     every mouse move, so an image grid downstream flickers at ~60 fps
+     as the user moves the cursor. Use the
+     [`mo.state` + `.observe(names=[...])` pattern from the marimo
+     docs](https://docs.marimo.io/api/inputs/anywidget/) to bridge
+     **only the specific traits you care about** into marimo's
+     reactive graph:
+
+     ```python
+     chart = mo.ui.anywidget(scatter.widget)  # still wrap so it renders
+     get_sel, set_sel = mo.state(scatter.widget.selection)
+     scatter.widget.observe(
+         lambda _c: set_sel(scatter.widget.selection),
+         names=["selection"],
+     )
+     # downstream cell reads get_sel(), not chart.value
+     ```
+
+     The chart cell returns both `chart` (for rendering) and `get_sel`
+     (for downstream). Cells that read `get_sel()` re-run only on
+     selection changes — no flicker.
 
 ## Process for a new composition
 
